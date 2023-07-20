@@ -757,7 +757,6 @@ func (d *Driver) List(ctx context.Context, prefix, startKey string, limit, revis
 }
 
 func (d *Driver) listAfter(ctx context.Context, prefix string, revision int64) (revRet int64, eventRet []*server.Event, errRet error) {
-
 	entries, err := d.getKeyValues(ctx, prefix, false)
 
 	if err != nil {
@@ -876,14 +875,20 @@ func (d *Driver) Update(ctx context.Context, key string, value []byte, revision,
 }
 
 func (d *Driver) Watch(ctx context.Context, prefix string, revision int64) <-chan []*server.Event {
-
+	// TODO: refactor to use a consumer to start after revision.
 	watcher, err := d.kv.(*kv.EncodedKV).Watch(prefix, nats.IgnoreDeletes(), nats.Context(ctx))
+	if err != nil {
+		logrus.Errorf("failed to create watcher %s for revision %d", prefix, revision)
+		ch := make(chan []*server.Event, 0)
+		close(ch)
+		return ch
+	}
 
 	if revision > 0 {
 		revision--
 	}
-	_, events, err := d.listAfter(ctx, prefix, revision)
 
+	_, events, err := d.listAfter(ctx, prefix, revision)
 	if err != nil {
 		logrus.Errorf("failed to create watcher %s for revision %d", prefix, revision)
 	}
@@ -891,7 +896,6 @@ func (d *Driver) Watch(ctx context.Context, prefix string, revision int64) <-cha
 	result := make(chan []*server.Event, 100)
 
 	go func() {
-
 		if len(events) > 0 {
 			result <- events
 			revision = events[len(events)-1].KV.ModRevision
@@ -951,6 +955,7 @@ func (d *Driver) Watch(ctx context.Context, prefix string, revision int64) <-cha
 			}
 		}
 	}()
+
 	return result
 }
 
