@@ -130,6 +130,7 @@ func (e *EncodedKV) newWatcher(w nats.KeyWatcher) nats.KeyWatcher {
 }
 
 func (e *EncodedKV) Get(key string) (nats.KeyValueEntry, error) {
+	logrus.Infof("KINE-KV: GET: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return nil, err
@@ -148,6 +149,7 @@ func (e *EncodedKV) Get(key string) (nats.KeyValueEntry, error) {
 }
 
 func (e *EncodedKV) GetRevision(key string, revision uint64) (nats.KeyValueEntry, error) {
+	logrus.Infof("KINE-KV: GET-REV: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return nil, err
@@ -166,7 +168,7 @@ func (e *EncodedKV) GetRevision(key string, revision uint64) (nats.KeyValueEntry
 }
 
 func (e *EncodedKV) Put(key string, value []byte) (revision uint64, err error) {
-	logrus.Infof("PUT: %s", key)
+	logrus.Infof("KINE-KV: PUT: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return 0, err
@@ -183,7 +185,7 @@ func (e *EncodedKV) Put(key string, value []byte) (revision uint64, err error) {
 }
 
 func (e *EncodedKV) Create(key string, value []byte) (revision uint64, err error) {
-	logrus.Infof("CREATE: %s", key)
+	logrus.Infof("KINE-KV: CREATE: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return 0, err
@@ -200,7 +202,7 @@ func (e *EncodedKV) Create(key string, value []byte) (revision uint64, err error
 }
 
 func (e *EncodedKV) Update(key string, value []byte, last uint64) (revision uint64, err error) {
-	logrus.Infof("UPDATE: %s", key)
+	logrus.Infof("KINE-KV: UPDATE: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return 0, err
@@ -217,7 +219,7 @@ func (e *EncodedKV) Update(key string, value []byte, last uint64) (revision uint
 }
 
 func (e *EncodedKV) Delete(key string, opts ...nats.DeleteOpt) error {
-	logrus.Infof("DELETE: %s", key)
+	logrus.Infof("KINE-KV: DELETE: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return err
@@ -236,6 +238,7 @@ func (e *EncodedKV) Purge(key string, opts ...nats.DeleteOpt) error {
 }
 
 func (e *EncodedKV) Watch(keys string, opts ...nats.WatchOpt) (nats.KeyWatcher, error) {
+	logrus.Infof("KINE-KV: WATCH: %s", keys)
 	ek, err := e.keyCodec.EncodeRange(keys)
 	if err != nil {
 		return nil, err
@@ -250,6 +253,7 @@ func (e *EncodedKV) Watch(keys string, opts ...nats.WatchOpt) (nats.KeyWatcher, 
 }
 
 func (e *EncodedKV) History(key string, opts ...nats.WatchOpt) ([]nats.KeyValueEntry, error) {
+	logrus.Infof("KINE-KV: HISTORY: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return nil, err
@@ -275,6 +279,7 @@ func (e *EncodedKV) WatchAll(opts ...nats.WatchOpt) (nats.KeyWatcher, error) {
 	return e.bucket.WatchAll(opts...)
 }
 func (e *EncodedKV) Keys(opts ...nats.WatchOpt) ([]string, error) {
+	logrus.Infof("KINE-KV: KEYS")
 	keys, err := e.bucket.Keys(opts...)
 	if err != nil {
 		return nil, err
