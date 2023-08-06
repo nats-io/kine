@@ -166,6 +166,7 @@ func (e *EncodedKV) GetRevision(key string, revision uint64) (nats.KeyValueEntry
 }
 
 func (e *EncodedKV) Put(key string, value []byte) (revision uint64, err error) {
+	logrus.Infof("PUT: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return 0, err
@@ -182,6 +183,7 @@ func (e *EncodedKV) Put(key string, value []byte) (revision uint64, err error) {
 }
 
 func (e *EncodedKV) Create(key string, value []byte) (revision uint64, err error) {
+	logrus.Infof("CREATE: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return 0, err
@@ -198,6 +200,7 @@ func (e *EncodedKV) Create(key string, value []byte) (revision uint64, err error
 }
 
 func (e *EncodedKV) Update(key string, value []byte, last uint64) (revision uint64, err error) {
+	logrus.Infof("UPDATE: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return 0, err
@@ -214,6 +217,7 @@ func (e *EncodedKV) Update(key string, value []byte, last uint64) (revision uint
 }
 
 func (e *EncodedKV) Delete(key string, opts ...nats.DeleteOpt) error {
+	logrus.Infof("DELETE: %s", key)
 	ek, err := e.keyCodec.Encode(key)
 	if err != nil {
 		return err
