@@ -19,7 +19,7 @@ import (
 
 // newReplayFixture creates a bucket with a handful of keys already written, and
 // returns a KeyValue that has not been started yet.
-func newReplayFixture(t *testing.T, ctx context.Context, wg *sync.WaitGroup) (*KeyValue, jetstream.JetStream, func()) {
+func newReplayFixture(ctx context.Context, t *testing.T, wg *sync.WaitGroup) (*KeyValue, jetstream.JetStream, func()) {
 	t.Helper()
 
 	p := benchParams{keys: 20, revs: 3, valSize: 128, history: 10}
@@ -72,7 +72,7 @@ func TestReplayReadyAfterWatcherRestart(t *testing.T) {
 		wg.Wait()
 	}()
 
-	kv, _, stop := newReplayFixture(t, ctx, wg)
+	kv, _, stop := newReplayFixture(ctx, t, wg)
 	defer stop()
 
 	// Simulate the state Start() hands to a *restarted* btreeWatcher: the index

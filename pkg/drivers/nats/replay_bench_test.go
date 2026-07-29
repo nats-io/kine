@@ -109,7 +109,7 @@ func startBenchServer(tb testing.TB, storeDir string) *server.Server {
 // async publishes. It intentionally bypasses Backend.Create/Update: those are
 // synchronous round trips and would dominate setup time, and the resulting
 // stream is identical in shape to one written by the backend.
-func populateBucket(tb testing.TB, ctx context.Context, js jetstream.JetStream, bucket string, p benchParams) (live int, wire int64) {
+func populateBucket(ctx context.Context, tb testing.TB, js jetstream.JetStream, bucket string, p benchParams) (live int, wire int64) {
 	tb.Helper()
 
 	kc := &keyCodec{}
@@ -238,7 +238,7 @@ func setupReplayFixture(tb testing.TB, p benchParams) (*server.Server, string) {
 	}
 
 	start := time.Now()
-	populateBucket(tb, ctx, js, "kine", p)
+	populateBucket(ctx, tb, js, "kine", p)
 	tb.Logf("population took %s (%s)", time.Since(start).Round(time.Millisecond), p)
 
 	return ns, storeDir
@@ -349,6 +349,9 @@ func BenchmarkColdStartReplay(b *testing.B) {
 		totalBytes += inBytes
 		totalMsgs += inMsgs
 
+		// Force collection so heap_MiB reports retained replay state rather
+		// than setup garbage.
+		//nolint:revive // This benchmark intentionally measures retained heap.
 		runtime.GC()
 		var ms runtime.MemStats
 		runtime.ReadMemStats(&ms)

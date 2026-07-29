@@ -1,6 +1,7 @@
 package nats
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"strings"
@@ -132,7 +133,10 @@ var (
 type valueCodec struct{}
 
 func (*valueCodec) Encode(src []byte, dst io.Writer) error {
-	enc, _ := s2Writers.Get().(*s2.Writer)
+	enc, ok := s2Writers.Get().(*s2.Writer)
+	if !ok {
+		return errors.New("unexpected s2 writer pool value")
+	}
 	enc.Reset(dst)
 	defer func() {
 		// Release the reference to dst so a pooled writer cannot pin it.
@@ -148,7 +152,10 @@ func (*valueCodec) Encode(src []byte, dst io.Writer) error {
 }
 
 func (*valueCodec) Decode(src io.Reader, dst io.Writer) error {
-	dec, _ := s2Readers.Get().(*s2.Reader)
+	dec, ok := s2Readers.Get().(*s2.Reader)
+	if !ok {
+		return errors.New("unexpected s2 reader pool value")
+	}
 	dec.Reset(src)
 	defer func() {
 		dec.Reset(nil)
