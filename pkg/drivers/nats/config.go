@@ -28,6 +28,9 @@ type Config struct {
 	replicas int
 	// Indicates the duration of a method before it is considered slow. Defaults to 500ms.
 	slowThreshold time.Duration
+	// How long to wait at startup for the index to catch up with the stream.
+	// Defaults to 1m.
+	replayTimeout time.Duration
 	// If true, an embedded server will not be used.
 	noEmbed bool
 	// If true, use a socket for the embedded server.
@@ -51,6 +54,7 @@ func parseConnection(dsn string, tlsInfo tls.Config) (*Config, error) {
 		revHistory:    defaultRevHistory,
 		bucket:        defaultBucket,
 		replicas:      defaultReplicas,
+		replayTimeout: defaultReplayTimeout,
 	}
 
 	// Parse the first URL in the connection string which contains the
@@ -93,6 +97,17 @@ func parseConnection(dsn string, tlsInfo tls.Config) (*Config, error) {
 		} else {
 			return nil, errors.New("invalid slowMethod duration " + d)
 		}
+	}
+
+	if d := queryMap.Get("replayTimeout"); d != "" {
+		dur, err := time.ParseDuration(d)
+		if err != nil {
+			return nil, errors.New("invalid replayTimeout duration " + d)
+		}
+		if dur <= 0 {
+			return nil, errors.New("replayTimeout must be greater than zero")
+		}
+		config.replayTimeout = dur
 	}
 
 	if r := queryMap.Get("revHistory"); r != "" {

@@ -22,6 +22,10 @@ const (
 	defaultReplicas   = 1
 	defaultRevHistory = 10
 	defaultSlowMethod = 500 * time.Millisecond
+
+	// defaultReplayTimeout bounds the wait for the index to catch up with the
+	// stream at startup. Overridable via the replayTimeout query parameter.
+	defaultReplayTimeout = time.Minute
 )
 
 var (
@@ -216,6 +220,7 @@ func newBackend(ctx context.Context, wg *sync.WaitGroup, connection string, tlsI
 	}
 
 	kv := NewKeyValue(name, wg, bucket, js, int(config.revHistory), b.Delete)
+	kv.SetReplayTimeout(config.replayTimeout)
 
 	b.kv = kv
 

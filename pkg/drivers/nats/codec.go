@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/klauspost/compress/s2"
 	"github.com/nats-io/nats.go/jetstream"
@@ -110,13 +111,36 @@ func (*keyCodec) Decode(key string) (retKey string, e error) {
 	return dk, nil
 }
 
+// s2 sizes its stream buffers for the 1MiB default block size, so a fresh
+// Reader or Writer costs well over a megabyte of allocation regardless of how
+// small the value is. kine encodes and decodes one value per operation, which
+// made that allocation — not the compression — the dominant cost of every Get,
+// List element, watch event and index replay message. Pooling keeps the buffers
+// alive across calls; Reset fully clears read/write position and error state.
+var (
+	s2Readers = sync.Pool{
+		New: func() any { return s2.NewReader(nil) },
+	}
+	s2Writers = sync.Pool{
+		// Concurrency 1: values are single small buffers, so the parallel block
+		// pipeline only adds goroutine churn per Reset.
+		New: func() any { return s2.NewWriter(nil, s2.WriterConcurrency(1)) },
+	}
+)
+
 // valueCodec is a codec that compresses values using s2.
 type valueCodec struct{}
 
 func (*valueCodec) Encode(src []byte, dst io.Writer) error {
-	enc := s2.NewWriter(dst)
-	err := enc.EncodeBuffer(src)
-	if err != nil {
+	enc, _ := s2Writers.Get().(*s2.Writer)
+	enc.Reset(dst)
+	defer func() {
+		// Release the reference to dst so a pooled writer cannot pin it.
+		enc.Reset(nil)
+		s2Writers.Put(enc)
+	}()
+
+	if err := enc.EncodeBuffer(src); err != nil {
 		enc.Close()
 		return err
 	}
@@ -124,7 +148,13 @@ func (*valueCodec) Encode(src []byte, dst io.Writer) error {
 }
 
 func (*valueCodec) Decode(src io.Reader, dst io.Writer) error {
-	dec := s2.NewReader(src)
+	dec, _ := s2Readers.Get().(*s2.Reader)
+	dec.Reset(src)
+	defer func() {
+		dec.Reset(nil)
+		s2Readers.Put(dec)
+	}()
+
 	_, err := io.Copy(dst, dec)
 	return err
 }

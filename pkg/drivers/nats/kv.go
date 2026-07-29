@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,18 +20,48 @@ import (
 
 var errStopKeyValue = errors.New("stopping key value")
 
+const (
+	// kineOpHeader marks a KV put that is really a kine tombstone. kine records
+	// a delete as a normal put whose payload carries Delete=true, so without
+	// this header the only way to classify a message is to fetch and decode its
+	// payload — which is what made index replay pull the entire bucket over the
+	// network and JSON-decode all of it. Older streams have no such header; see
+	// btreeWatcher for how their tombstones are recovered.
+	kineOpHeader = "Kine-Op"
+	kineOpDelete = "DEL"
+
+	kvOperationHeader = "KV-Operation"
+
+	// replayProgressInterval is how often an in-progress index replay logs.
+	replayProgressInterval = 10 * time.Second
+)
+
 type keySeq struct {
 	key string
 	seq uint64
 }
 
 type entry struct {
-	kc    *keyCodec
-	vc    *valueCodec
-	entry jetstream.KeyValueEntry
+	kc *keyCodec
+	vc *valueCodec
+	// key holds the already-decoded key when the producer of this entry had it
+	// to hand, avoiding a second base58 decode of the same subject.
+	key string
+	// tombstone reports that this put carried the kine tombstone header, known
+	// without reading the payload. Only set by the Watch handler.
+	tombstone bool
+	// prevSeq is the sequence this message was written against
+	// (Nats-Expected-Last-Subject-Sequence), or zero if unconditional. Only set
+	// by the Watch handler.
+	prevSeq uint64
+	entry   jetstream.KeyValueEntry
 }
 
 func (e *entry) Key() string {
+	if e.key != "" {
+		return e.key
+	}
+
 	dk, err := e.kc.Decode(e.entry.Key())
 	// should not happen
 	if err != nil {
@@ -59,7 +90,6 @@ func (e *entry) Operation() jetstream.KeyValueOp { return e.entry.Operation() }
 type seqOp struct {
 	seq uint64
 	op  jetstream.KeyValueOp
-	ex  time.Time
 }
 
 type streamWatcher struct {
@@ -131,28 +161,41 @@ type KeyValue struct {
 	compactRev atomic.Int64
 	readyCh    chan struct{}
 	ready      atomic.Bool
-	seqCond    *sync.Cond // Broadcasts on btree update for read-after-write consistency
-	ctx        context.Context
-	cancel     context.CancelCauseFunc
-	wg         *sync.WaitGroup
+	seqCond    *sync.Cond   // Broadcasts on btree update for read-after-write consistency
+	seqWaiters atomic.Int64 // Number of waiters in waitForSequence
+	// replayTimeout bounds how long Start blocks waiting for the index to catch
+	// up with the stream before giving up.
+	replayTimeout time.Duration
+	ctx           context.Context
+	cancel        context.CancelCauseFunc
+	wg            *sync.WaitGroup
 }
 
 func NewKeyValue(name string, wg *sync.WaitGroup, bucket jetstream.KeyValue, js jetstream.JetStream, revHistory int, deleteFn DeleteFn) *KeyValue {
 	kv := &KeyValue{
-		name:       name,
-		revHistory: revHistory,
-		nkv:        bucket,
-		js:         js,
-		kc:         &keyCodec{},
-		vc:         &valueCodec{},
-		bt:         btree.NewMap[string, []*seqOp](0),
-		ew:         NewExpireWatcher(deleteFn),
-		seqCond:    sync.NewCond(&sync.Mutex{}),
-		readyCh:    make(chan struct{}),
-		wg:         wg,
+		name:          name,
+		revHistory:    revHistory,
+		nkv:           bucket,
+		js:            js,
+		kc:            &keyCodec{},
+		vc:            &valueCodec{},
+		bt:            btree.NewMap[string, []*seqOp](0),
+		ew:            NewExpireWatcher(deleteFn),
+		seqCond:       sync.NewCond(&sync.Mutex{}),
+		readyCh:       make(chan struct{}),
+		replayTimeout: defaultReplayTimeout,
+		wg:            wg,
 	}
 
 	return kv
+}
+
+// SetReplayTimeout overrides how long Start waits for the index to catch up with
+// the stream. Must be called before Start.
+func (e *KeyValue) SetReplayTimeout(d time.Duration) {
+	if d > 0 {
+		e.replayTimeout = d
+	}
 }
 
 func (e *KeyValue) Start(ctx context.Context) {
@@ -261,6 +304,17 @@ func (e *KeyValue) Create(ctx context.Context, key string, value []byte) (uint64
 }
 
 func (e *KeyValue) Update(ctx context.Context, key string, value []byte, last uint64) (uint64, error) {
+	return e.update(ctx, key, value, last, false)
+}
+
+// UpdateTombstone writes a kine delete tombstone. It is identical to Update
+// except that the message is tagged so the index can recognize it from headers
+// alone.
+func (e *KeyValue) UpdateTombstone(ctx context.Context, key string, value []byte, last uint64) (uint64, error) {
+	return e.update(ctx, key, value, last, true)
+}
+
+func (e *KeyValue) update(ctx context.Context, key string, value []byte, last uint64, tombstone bool) (uint64, error) {
 	ek, err := e.kc.Encode(key)
 	if err != nil {
 		return 0, err
@@ -273,7 +327,12 @@ func (e *KeyValue) Update(ctx context.Context, key string, value []byte, last ui
 		return 0, err
 	}
 
-	rev, err := e.nkv.Update(ctx, ek, buf.Bytes(), last)
+	var rev uint64
+	if tombstone {
+		rev, err = e.publishTombstone(ctx, ek, buf.Bytes(), last)
+	} else {
+		rev, err = e.nkv.Update(ctx, ek, buf.Bytes(), last)
+	}
 	if err != nil {
 		return rev, err
 	}
@@ -285,6 +344,23 @@ func (e *KeyValue) Update(ctx context.Context, key string, value []byte, last ui
 	}
 
 	return rev, nil
+}
+
+// publishTombstone performs the same publish as jetstream's KeyValue.Update —
+// same subject, same expected-last-subject-sequence CAS, so the same
+// JSErrCodeStreamWrongLastSequence surfaces on conflict — with the kine
+// tombstone header attached. nats.go's KeyValue API has no way to pass headers.
+func (e *KeyValue) publishTombstone(ctx context.Context, encodedKey string, value []byte, last uint64) (uint64, error) {
+	msg := nats.NewMsg(fmt.Sprintf("$KV.%s.%s", e.nkv.Bucket(), encodedKey))
+	msg.Data = value
+	msg.Header.Set(kineOpHeader, kineOpDelete)
+
+	ack, err := e.js.PublishMsg(ctx, msg, jetstream.WithExpectLastSequencePerSubject(last))
+	if err != nil {
+		return 0, err
+	}
+
+	return ack.Sequence, nil
 }
 
 func (e *KeyValue) Delete(ctx context.Context, key string, opts ...jetstream.KVDeleteOpt) error {
@@ -324,7 +400,26 @@ type KeyWatcher interface {
 	Err() <-chan error
 }
 
-func (e *KeyValue) Watch(ctx context.Context, key, end string, startRev int64) (KeyWatcher, error) {
+// WatchOpt configures a Watch.
+type WatchOpt func(*watchOpts)
+
+type watchOpts struct {
+	headersOnly bool
+}
+
+// WithHeadersOnly asks the server to deliver message headers without payloads.
+// Only useful for consumers that classify messages rather than read their
+// values — the index replay, which would otherwise pull the whole bucket.
+func WithHeadersOnly() WatchOpt {
+	return func(o *watchOpts) { o.headersOnly = true }
+}
+
+func (e *KeyValue) Watch(ctx context.Context, key, end string, startRev int64, opts ...WatchOpt) (KeyWatcher, error) {
+	var wo watchOpts
+	for _, opt := range opts {
+		opt(&wo)
+	}
+
 	// Everything but the last token will be treated as a filter
 	// on the watcher. The last token will used as a deliver-time filter.
 	filter := key
@@ -361,9 +456,15 @@ func (e *KeyValue) Watch(ctx context.Context, key, end string, startRev int64) (
 			return
 		}
 
+		// Decode once and carry the result on the entry. keyCodec.Decode is
+		// base58 big-integer math per '/'-separated token, and the consumer of
+		// this channel needs the same decoded key, so decoding it twice per
+		// message was a material share of replay cost.
+		var dkey string
 		skey := strings.TrimPrefix(msg.Subject(), subjectPrefix)
 		if skey != "" {
-			dkey, err := e.kc.Decode(strings.TrimPrefix(skey, "."))
+			var err error
+			dkey, err = e.kc.Decode(strings.TrimPrefix(skey, "."))
 			if err != nil || (key == "" && dkey < key) || (end != "" && dkey >= end) {
 				return
 			}
@@ -371,7 +472,8 @@ func (e *KeyValue) Watch(ctx context.Context, key, end string, startRev int64) (
 
 		// Default is PUT
 		var op jetstream.KeyValueOp
-		switch msg.Headers().Get("KV-Operation") {
+		hdr := msg.Headers()
+		switch hdr.Get(kvOperationHeader) {
 		case "DEL":
 			op = jetstream.KeyValueDelete
 		case "PURGE":
@@ -380,9 +482,23 @@ func (e *KeyValue) Watch(ctx context.Context, key, end string, startRev int64) (
 		// Not currently used...
 		delta := 0
 
+		// Reported separately from Operation: Backend.Watch must still see a
+		// tombstone as a PUT so it can emit a delete event from the payload.
+		tombstone := op == jetstream.KeyValuePut && hdr.Get(kineOpHeader) == kineOpDelete
+
+		// The sequence this write was conditioned on, used to identify the
+		// message a delete marker supersedes.
+		var prevSeq uint64
+		if v := hdr.Get(jetstream.ExpectedLastSubjSeqHeader); v != "" {
+			prevSeq, _ = strconv.ParseUint(v, 10, 64)
+		}
+
 		updates <- &entry{
-			kc: e.kc,
-			vc: e.vc,
+			kc:        e.kc,
+			vc:        e.vc,
+			key:       dkey,
+			tombstone: tombstone,
+			prevSeq:   prevSeq,
 			entry: &kvEntry{
 				key:       skey,
 				bucket:    e.nkv.Bucket(),
@@ -405,6 +521,7 @@ func (e *KeyValue) Watch(ctx context.Context, key, end string, startRev int64) (
 	}
 	cfg.DeliverPolicy = dp
 	cfg.FilterSubjects = append(cfg.FilterSubjects, filter)
+	cfg.HeadersOnly = wo.headersOnly
 
 	con, err := e.js.OrderedConsumer(ctx, fmt.Sprintf("KV_%s", e.nkv.Bucket()), cfg)
 	if err != nil {
@@ -455,17 +572,18 @@ func (e *KeyValue) List(ctx context.Context, key, end string, limit, revision in
 		return nil, err
 	}
 
-	it := e.bt.Iter()
-	if key != "" {
-		if ok := it.Seek(key); !ok {
-			return nil, nil
-		}
-	}
-
 	var matches []*keySeq
 
+	// btree.Map is not safe for concurrent use and btreeWatcher calls Set
+	// continuously, so the iterator must be created and positioned under the
+	// same lock that guards the walk.
 	e.btm.RLock()
-	for {
+	it := e.bt.Iter()
+	seeked := true
+	if key != "" {
+		seeked = it.Seek(key)
+	}
+	for seeked {
 		k := it.Key()
 		if (end == "" && k != key) || (end != "" && k >= end) {
 			break
@@ -487,6 +605,10 @@ func (e *KeyValue) List(ctx context.Context, key, end string, limit, revision in
 		}
 	}
 	e.btm.RUnlock()
+
+	if !seeked {
+		return nil, nil
+	}
 
 	var entries []jetstream.KeyValueEntry
 	for _, m := range matches {
@@ -530,6 +652,12 @@ func (e *KeyValue) waitForSequence(ctx context.Context, seq uint64, timeout time
 	done := make(chan struct{}) // Closed when condition is met
 	stop := make(chan struct{}) // Closed when we should abort waiting
 
+	// Registered before the watcher's lastSeq re-check below, so the watcher
+	// either observes this waiter and broadcasts, or has already advanced
+	// lastSeq past seq and the re-check returns immediately.
+	e.seqWaiters.Add(1)
+	defer e.seqWaiters.Add(-1)
+
 	go func() {
 		e.seqCond.L.Lock()
 		defer e.seqCond.L.Unlock()
@@ -563,16 +691,28 @@ func (e *KeyValue) waitForSequence(ctx context.Context, seq uint64, timeout time
 	}
 }
 
+// markReady signals that the index has caught up with the stream. It is safe to
+// call from any watcher attempt and more than once.
+func (e *KeyValue) markReady() {
+	if e.ready.CompareAndSwap(false, true) {
+		close(e.readyCh)
+	}
+}
+
 // waitReady waits for the btree watcher to finish replaying history on startup.
 // This prevents reads from seeing incomplete/inconsistent state during cold start.
 func (e *KeyValue) waitReady(ctx context.Context) error {
-	timeout := time.NewTimer(time.Minute)
+	timeout := time.NewTimer(e.replayTimeout)
 	defer timeout.Stop()
 
 	for {
 		select {
 		case <-timeout.C:
-			return errors.New("timeout waiting for btree to be ready")
+			// Report how far replay got, so a slow replay can be told apart from
+			// a stuck one and the operator knows what to raise replayTimeout to.
+			return fmt.Errorf("timeout waiting for btree to be ready after %s (reached revision %d); "+
+				"raise it with the replayTimeout query parameter on the datastore endpoint",
+				e.replayTimeout, e.BucketRevision())
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-e.readyCh:
@@ -644,20 +784,30 @@ func (e *KeyValue) btreeWatcher(ctx context.Context, hsize int) error {
 	}
 	targetSeq := s.CachedInfo().State.LastSeq
 
-	isStartupReplay := br == 0
+	// Readiness must track whether the index has caught up with the stream, not
+	// whether this is the first attempt. Start() restarts this watcher after any
+	// consumer error, and by then lastSeq has advanced, so keying off br == 0
+	// left a restarted watcher unable to ever signal readiness — waitReady then
+	// burned its whole budget and Backend.Start aborted, permanently, since every
+	// process restart repeats it. A long replay is exactly where a consumer reset
+	// is most likely. See TestReplayReadyAfterWatcherRestart.
+	replaying := !e.ready.Load()
 
-	if isStartupReplay {
-		if targetSeq == 0 {
-			e.ready.Store(true)
-			close(e.readyCh)
-			isStartupReplay = false
-		} else {
-			logrus.Infof("%s: starting initial replay from 0 to %d", e.name, targetSeq)
-		}
+	if replaying && uint64(br) >= targetSeq {
+		// The bucket is empty, or the index already covers the stream. No further
+		// message is guaranteed to arrive to trigger the catch-up check below.
+		e.markReady()
+		replaying = false
+	} else if replaying {
+		logrus.Infof("%s: starting initial replay from %d to %d", e.name, br, targetSeq)
 	}
 
 	now := time.Now()
-	w, err := e.Watch(ctx, "/", "", br)
+	lastProgress := now
+	// The index stores only a sequence and an operation per revision, so the
+	// payloads are pure waste on this consumer — at the scale of k3s-io/kine#720
+	// that was 1.3 GiB pulled from the cluster on every process start.
+	w, err := e.Watch(ctx, "/", "", br, WithHeadersOnly())
 	if err != nil {
 		return fmt.Errorf("init: %s after %s", err, time.Since(now))
 	}
@@ -678,19 +828,21 @@ func (e *KeyValue) btreeWatcher(ctx context.Context, hsize int) error {
 
 			key := x.Key()
 
-			var ex time.Time
-			if op == jetstream.KeyValuePut {
-				var nd natsData
-				err = nd.Decode(x)
-				if err != nil {
-					continue
-				}
+			// Whether this message is a real KV delete marker, as opposed to a
+			// kine tombstone that merely reads as a delete. Captured before the
+			// tombstone remap below, because only a real marker may retroactively
+			// reclassify the message before it.
+			delMarker := op == jetstream.KeyValueDelete
 
-				if nd.Delete {
+			// A kine delete is a put whose payload says Delete=true. Messages
+			// written by this version say so in a header instead, so no payload
+			// is needed to classify them.
+			var supersedes uint64
+			if ent, ok := x.(*entry); ok {
+				if ent.tombstone {
 					op = jetstream.KeyValueDelete
-				} else if nd.KV.Lease > 0 {
-					ex = nd.CreateTime.Add(time.Second * time.Duration(nd.KV.Lease))
 				}
+				supersedes = ent.prevSeq
 			}
 
 			e.btm.Lock()
@@ -698,6 +850,39 @@ func (e *KeyValue) btreeWatcher(ctx context.Context, hsize int) error {
 			val, ok := e.bt.Get(key)
 			if !ok {
 				val = make([]*seqOp, 0, hsize)
+			}
+
+			// Tombstones on streams written before the header existed carry no
+			// marker, so recover them from the delete that follows: kine writes a
+			// tombstone put and then a KV delete marker pinned to the tombstone's
+			// sequence via expected-last-subject-sequence, so the marker's
+			// predecessor on that subject is the tombstone — and this per-key list
+			// is exactly that subject's message list.
+			//
+			// Known exception: kine before 52aa8b8 (2025-11-07) deleted
+			// lease-expired keys with a bare delete marker pinned to the *live*
+			// value's revision, with no tombstone put. On a stream that old, the
+			// last live version of an expired key is reclassified as deleted at its
+			// own revision. It is deleted at the current revision either way, so
+			// this only affects a read at exactly that historical revision, and
+			// only until the key is written again by a version that sets the
+			// header. The alternative — not recovering legacy tombstones at all —
+			// misreports every key deleted by current kine, which is worse.
+			//
+			// Matching is by sequence rather than by list position: the Watch
+			// handler drops messages below the compaction revision, so the last
+			// entry recorded for a key is not always the message the marker
+			// supersedes. A marker with no expected-sequence header did not come
+			// from kine and reclassifies nothing.
+			if delMarker && supersedes > 0 {
+				for i := len(val) - 1; i >= 0 && val[i].seq >= supersedes; i-- {
+					if val[i].seq == supersedes {
+						if val[i].op == jetstream.KeyValuePut {
+							val[i].op = jetstream.KeyValueDelete
+						}
+						break
+					}
+				}
 			}
 
 			// Remove the oldest entry.
@@ -708,7 +893,6 @@ func (e *KeyValue) btreeWatcher(ctx context.Context, hsize int) error {
 			val = append(val, &seqOp{
 				seq: seq,
 				op:  op,
-				ex:  ex,
 			})
 
 			e.bt.Set(key, val)
@@ -717,15 +901,30 @@ func (e *KeyValue) btreeWatcher(ctx context.Context, hsize int) error {
 
 			e.btm.Unlock()
 
-			// Broadcast to all waiters that sequence has advanced
-			e.seqCond.Broadcast()
+			// Broadcast to all waiters that sequence has advanced. During a cold
+			// start there are no writers waiting, so skipping the broadcast
+			// avoids a futex wake per replayed message. seqWaiters is incremented
+			// before the waiter re-checks lastSeq under seqCond.L, so a waiter
+			// that arrives concurrently either sees the new lastSeq itself or is
+			// counted here.
+			if e.seqWaiters.Load() > 0 {
+				e.seqCond.Broadcast()
+			}
 
 			// Check if startup replay is complete
-			if isStartupReplay && seq >= targetSeq && !e.ready.Load() {
-				e.ready.Store(true)
-				close(e.readyCh)
-				logrus.Infof("%s: btree replay complete at seq=%d (target was %d, took %s)",
-					e.name, seq, targetSeq, time.Since(now))
+			if replaying {
+				if seq >= targetSeq {
+					e.markReady()
+					replaying = false
+					logrus.Infof("%s: btree replay complete at seq=%d (target was %d, took %s)",
+						e.name, seq, targetSeq, time.Since(now))
+				} else if time.Since(lastProgress) >= replayProgressInterval {
+					// Without this, a slow replay is indistinguishable from a hung
+					// one, which is how k3s-io/kine#720 was diagnosed as a hang.
+					lastProgress = time.Now()
+					logrus.Infof("%s: btree replay at seq=%d of %d (%d keys indexed, %s elapsed)",
+						e.name, seq, targetSeq, e.bt.Len(), time.Since(now).Round(time.Second))
+				}
 			}
 		}
 	}
@@ -737,17 +936,17 @@ func (e *KeyValue) getListOps(key, end string, revision int64) ([]*keySeq, error
 		return nil, err
 	}
 
-	it := e.bt.Iter()
-	if key != "" {
-		if ok := it.Seek(key); !ok {
-			return nil, nil
-		}
-	}
-
 	var matches []*keySeq
 
+	// See KeyValue.List: the iterator must be created and positioned under the
+	// same lock that guards the walk.
 	e.btm.RLock()
-	for {
+	it := e.bt.Iter()
+	seeked := true
+	if key != "" {
+		seeked = it.Seek(key)
+	}
+	for seeked {
 		k := it.Key()
 		if (end == "" && k != key) || (end != "" && k >= end) {
 			break
@@ -765,6 +964,10 @@ func (e *KeyValue) getListOps(key, end string, revision int64) ([]*keySeq, error
 		}
 	}
 	e.btm.RUnlock()
+
+	if !seeked {
+		return nil, nil
+	}
 
 	return matches, nil
 }

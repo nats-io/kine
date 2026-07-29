@@ -36,6 +36,7 @@ The following client query parameters are supported:
 - `replicas` - Specifies the number of replicas for the bucket. Default is `1`.
 - `revHistory` - Specifies the number of revisions to keep in history. Default is `10`.
 - `slowMethod` - Specifies the duration of a method before it is considered slow. Default is `500ms`.
+- `replayTimeout` - Specifies how long to wait at startup for the in-memory index to catch up with the bucket before giving up. Default is `1m`. Raise it if startup fails with `timeout waiting for btree to be ready`; the error reports the revision replay reached, so a slow replay can be told apart from a stuck one.
 - `contextFile` - Specifies the path to a NATS context file. If this is provided, the `auth` and `host` should not be provided. See the available [options](https://docs.nats.io/using-nats/nats-tools/nats_cli#configuration-contexts). Default is nothing.
 
 These query parameters are relevant when the server is embedded:

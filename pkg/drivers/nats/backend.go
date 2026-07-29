@@ -36,11 +36,19 @@ func (d *natsData) Encode() ([]byte, error) {
 }
 
 func (d *natsData) Decode(e jetstream.KeyValueEntry) error {
-	if e == nil || e.Value() == nil {
+	if e == nil {
 		return nil
 	}
 
-	err := json.Unmarshal(e.Value(), d)
+	// Decode the value once. For entries backed by a watch or a fetched
+	// revision, Value() decompresses on every call, so reading it twice doubled
+	// the decompression cost of every Get, List element and watch event.
+	value := e.Value()
+	if value == nil {
+		return nil
+	}
+
+	err := json.Unmarshal(value, d)
 	if err != nil {
 		return err
 	}
@@ -274,7 +282,7 @@ func (b *Backend) Delete(ctx context.Context, key string, revision int64) (int64
 	}
 
 	// Update with a tombstone.
-	drev, err := b.kv.Update(ctx, key, data, uint64(rev))
+	drev, err := b.kv.UpdateTombstone(ctx, key, data, uint64(rev))
 	if err != nil {
 		if jsWrongLastSeqErr.Is(err) {
 			b.l.Debugf("delete conflict: key=%s, rev=%d, err=%s", key, rev, err)
